@@ -386,9 +386,19 @@ def copier(
     yt_search_algo: int = 0,
     *,
     yt: Optional[YTMusic] = None,
+    reverse_order: bool = False,
 ):
     """
-    @@@
+    Copy songs from src_tracks to dst_pl_id YTMusic playlist
+
+    Args:
+        src_tracks: Iterator of SongInfo objects to copy
+        dst_pl_id: YouTube Music playlist ID to copy to
+        dry_run: If True, don't actually add songs
+        track_sleep: Time to sleep between tracks
+        yt_search_algo: Algorithm to use for searching (0=exact, 1=extended, 2=approximate)
+        yt: YTMusic instance (will create one if None)
+        reverse_order: If True, reverse the order of tracks before adding to YouTube Music
     """
     if yt is None:
         yt = get_ytmusic()
@@ -405,10 +415,16 @@ def copier(
             sys.exit(1)
         print(f"== Youtube Playlist: {yt_pl['title']}")
 
-    tracks_added_set = set()
+    # Track statistics
+    songs_added = 0
     duplicate_count = 0
     error_count = 0
+    tracks_added_set = set()
 
+    # If we need to reverse the order, we need to collect all tracks first
+    tracks_to_process = []
+
+    print("Searching for tracks...")
     for src_track in src_tracks:
         print(f"Spotify:   {src_track.title} - {src_track.artist} - {src_track.album}")
 
@@ -431,35 +447,79 @@ def copier(
         if dst_track["videoId"] in tracks_added_set:
             print("(DUPLICATE, this track has already been added)")
             duplicate_count += 1
+            continue
+
         tracks_added_set.add(dst_track["videoId"])
 
-        if not dry_run:
-            exception_sleep = 5
-            for _ in range(10):
-                try:
-                    if dst_pl_id is not None:
-                        yt.add_playlist_items(
-                            playlistId=dst_pl_id,
-                            videoIds=[dst_track["videoId"]],
-                            duplicates=False,
-                        )
-                    else:
-                        yt.rate_song(dst_track["videoId"], "LIKE")
-                    break
-                except Exception as e:
-                    print(
-                        f"ERROR: (Retrying add_playlist_items: {dst_pl_id} {dst_track['videoId']}) {e} in {exception_sleep} seconds"
-                    )
-                    time.sleep(exception_sleep)
-                    exception_sleep *= 2
+        # If we need to reverse the order, we collect tracks first
+        if reverse_order:
+            tracks_to_process.append(dst_track)
+        else:
+            # Otherwise add each song immediately
+            if not dry_run:
+                add_single_song_to_playlist(yt, dst_pl_id, dst_track)
+                songs_added += 1
+                if track_sleep:
+                    time.sleep(track_sleep)
 
-        if track_sleep:
-            time.sleep(track_sleep)
+    # If we collected tracks to reverse them, now process them
+    if reverse_order and tracks_to_process:
+        print("Reversing tracks order for YouTube Music...")
+        tracks_to_process.reverse()
+
+        if not dry_run:
+            print(f"Adding {len(tracks_to_process)} tracks to YouTube Music...")
+            for dst_track in tracks_to_process:
+                add_single_song_to_playlist(yt, dst_pl_id, dst_track)
+                songs_added += 1
+                if track_sleep:
+                    time.sleep(track_sleep)
 
     print()
     print(
-        f"Added {len(tracks_added_set)} tracks, encountered {duplicate_count} duplicates, {error_count} errors"
+        f"Added {songs_added} tracks, encountered {duplicate_count} duplicates, {error_count} errors"
     )
+
+
+def add_single_song_to_playlist(
+    yt: YTMusic, playlist_id: Optional[str], track: dict
+) -> bool:
+    """
+    Add a single song to a YouTube Music playlist with retry logic
+
+    Args:
+        yt: YTMusic instance
+        playlist_id: ID of the playlist to add to, or None for liked songs
+        track: Track information from YTMusic API
+
+    Returns:
+        bool: Whether the song was successfully added
+    """
+    exception_sleep = 5
+    for attempt in range(10):
+        try:
+            if playlist_id is not None:
+                # Add to specified playlist
+                yt.add_playlist_items(
+                    playlistId=playlist_id,
+                    videoIds=[track["videoId"]],
+                    duplicates=False,
+                )
+                print(f"Added: {track['title']}")
+            else:
+                # For liked songs
+                yt.rate_song(track["videoId"], "LIKE")
+                print(f"Liked: {track['title']}")
+            return True
+        except Exception as e:
+            print(
+                f"ERROR: (Retrying adding {track['title']}) {e} in {exception_sleep} seconds"
+            )
+            time.sleep(exception_sleep)
+            exception_sleep *= 2
+
+    print(f"Failed to add {track['title']} after multiple retries")
+    return False
 
 
 def copy_playlist(
@@ -474,13 +534,22 @@ def copy_playlist(
 ):
     """
     Copy a Spotify playlist to a YTMusic playlist
-    @@@
+
+    Args:
+        spotify_playlist_id: Spotify playlist ID to copy from
+        ytmusic_playlist_id: YouTube Music playlist ID to copy to (or +name to look up)
+        spotify_playlists_encoding: Encoding of the playlists.json file
+        dry_run: If True, don't actually add songs
+        track_sleep: Time to sleep between tracks
+        yt_search_algo: Algorithm to use for searching (0=exact, 1=extended, 2=approximate)
+        reverse_playlist: If True, reverse the order of tracks from Spotify
+        privacy_status: Privacy status of created playlist (PRIVATE, PUBLIC, UNLISTED)
     """
     print("Using search algo n°: ", yt_search_algo)
     yt = get_ytmusic()
     pl_name: str = ""
 
-    if ytmusic_playlist_id.startswith("+"):
+    if ytmusic_playlist_id and ytmusic_playlist_id.startswith("+"):
         pl_name = ytmusic_playlist_id[1:]
 
         ytmusic_playlist_id = get_playlist_id_by_name(yt, pl_name)
@@ -507,6 +576,9 @@ def copy_playlist(
             sys.exit(1)
         print(f"NOTE: Created playlist '{pl_name}' with ID: {ytmusic_playlist_id}")
 
+    # Since we're adding songs in batches now, we need to use the same behavior
+    # for both Spotify and YouTube Music. The reverse_playlist parameter handles the
+    # Spotify side, and we'll now pass a parameter to control the YouTube Music side.
     copier(
         iter_spotify_playlist(
             spotify_playlist_id,
@@ -518,6 +590,7 @@ def copy_playlist(
         track_sleep,
         yt_search_algo,
         yt=yt,
+        reverse_order=not reverse_playlist,  # Invert the order for YouTube Music if needed
     )
 
 
@@ -566,6 +639,8 @@ def copy_all_playlists(
             dry_run,
             track_sleep,
             yt_search_algo,
+            yt=yt,
+            reverse_order=not reverse_playlist,  # Invert the order for YouTube Music if needed
         )
         print("\nPlaylist done!\n")
 
