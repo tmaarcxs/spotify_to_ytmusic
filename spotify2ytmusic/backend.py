@@ -118,7 +118,7 @@ def iter_spotify_playlist(
     src_pl_id: Optional[str] = None,
     spotify_playlist_file: str = "playlists.json",
     spotify_encoding: str = "utf-8",
-    reverse_playlist: bool = True,
+    reverse_playlist: bool = False,
 ) -> Iterator[SongInfo]:
     """Songs from a specific album ("Liked Songs" if None)
 
@@ -126,7 +126,7 @@ def iter_spotify_playlist(
         `src_pl_id` (Optional[str], optional): The ID of the source playlist. Defaults to None.
         `spotify_playlist_file` (str, optional): The path to the playlists backup files. Defaults to "playlists.json".
         `spotify_encoding` (str, optional): Characters encoding. Defaults to "utf-8".
-        `reverse_playlist` (bool, optional): Is the playlist reversed when loading?  Defaults to True.
+        `reverse_playlist` (bool, optional): Is the playlist reversed when loading?  Defaults to False.
 
     Yields:
         Iterator[SongInfo]: The song's information
@@ -152,9 +152,11 @@ def iter_spotify_playlist(
 
     print(f"== Spotify Playlist: {src_pl_name}")
 
-    pl_tracks = src_pl["tracks"]
-    if reverse_playlist:
-        pl_tracks = reversed(pl_tracks)
+    # Sort tracks by added_at date before processing them
+    pl_tracks = sorted(
+        src_pl["tracks"], key=lambda x: x.get("added_at", ""), reverse=reverse_playlist
+    )
+    print(f"DEBUG: Sorted tracks by added_at date, reverse={reverse_playlist}")
 
     for src_track in pl_tracks:
         if src_track["track"] is None:
@@ -170,6 +172,10 @@ def iter_spotify_playlist(
             print(f"ERROR: Spotify track seems to be malformed.  Track: {src_track!r}")
             raise e
         src_track_name = src_track["track"]["name"]
+
+        # Print the date the track was added for debugging
+        added_date = src_track.get("added_at", "Unknown date")
+        print(f"DEBUG: Track {src_track_name} was added at {added_date}")
 
         yield SongInfo(src_track_name, src_track_artist, src_album_name)
 
@@ -403,9 +409,14 @@ def copier(
     if yt is None:
         yt = get_ytmusic()
 
+    print(
+        f"DEBUG: Copier started with parameters - dst_pl_id: {dst_pl_id}, dry_run: {dry_run}, reverse_order: {reverse_order}"
+    )
+
     if dst_pl_id is not None:
         try:
             yt_pl = yt.get_playlist(playlistId=dst_pl_id)
+            print(f"DEBUG: Successfully retrieved playlist with ID {dst_pl_id}")
         except Exception as e:
             print(f"ERROR: Unable to find YTMusic playlist {dst_pl_id}: {e}")
             print(
@@ -425,10 +436,15 @@ def copier(
     tracks_to_process = []
 
     print("Searching for tracks...")
+    track_count = 0
     for src_track in src_tracks:
+        track_count += 1
         print(f"Spotify:   {src_track.title} - {src_track.artist} - {src_track.album}")
 
         try:
+            print(
+                f"DEBUG: Looking up song {src_track.title} by {src_track.artist} with algorithm {yt_search_algo}"
+            )
             dst_track = lookup_song(
                 yt, src_track.title, src_track.artist, src_track.album, yt_search_algo
             )
@@ -453,27 +469,47 @@ def copier(
 
         # If we need to reverse the order, we collect tracks first
         if reverse_order:
+            print(f"DEBUG: Collecting track for later (reverse order is enabled)")
             tracks_to_process.append(dst_track)
         else:
             # Otherwise add each song immediately
             if not dry_run:
-                add_single_song_to_playlist(yt, dst_pl_id, dst_track)
-                songs_added += 1
+                print(f"DEBUG: Adding song immediately (reverse order is disabled)")
+                success = add_single_song_to_playlist(yt, dst_pl_id, dst_track)
+                if success:
+                    songs_added += 1
+                else:
+                    error_count += 1
                 if track_sleep:
                     time.sleep(track_sleep)
+            else:
+                print("DEBUG: Dry run enabled, not actually adding song")
+
+    print(
+        f"DEBUG: Found {track_count} tracks from Spotify, collected {len(tracks_to_process)} for reverse processing"
+    )
 
     # If we collected tracks to reverse them, now process them
     if reverse_order and tracks_to_process:
-        print("Reversing tracks order for YouTube Music...")
+        print(
+            f"DEBUG: Reversing {len(tracks_to_process)} tracks order for YouTube Music..."
+        )
         tracks_to_process.reverse()
 
         if not dry_run:
             print(f"Adding {len(tracks_to_process)} tracks to YouTube Music...")
             for dst_track in tracks_to_process:
-                add_single_song_to_playlist(yt, dst_pl_id, dst_track)
-                songs_added += 1
+                success = add_single_song_to_playlist(yt, dst_pl_id, dst_track)
+                if success:
+                    songs_added += 1
+                else:
+                    error_count += 1
                 if track_sleep:
                     time.sleep(track_sleep)
+        else:
+            print(
+                "DEBUG: Dry run enabled, not actually adding songs from reverse order collection"
+            )
 
     print()
     print(
@@ -495,26 +531,38 @@ def add_single_song_to_playlist(
     Returns:
         bool: Whether the song was successfully added
     """
+    print(
+        f"DEBUG: Attempting to add song {track['title']} (ID: {track['videoId']}) to playlist {playlist_id}"
+    )
     exception_sleep = 5
     for attempt in range(10):
         try:
             if playlist_id is not None:
                 # Add to specified playlist
-                yt.add_playlist_items(
+                print(
+                    f"DEBUG: API call - Adding video ID {track['videoId']} to playlist {playlist_id}"
+                )
+                # Setting source_playlist=None makes YouTube Music add the song to the end of the playlist
+                result = yt.add_playlist_items(
                     playlistId=playlist_id,
                     videoIds=[track["videoId"]],
                     duplicates=False,
+                    source_playlist=None,
                 )
+                print(f"DEBUG: API response: {result}")
                 print(f"Added: {track['title']}")
             else:
                 # For liked songs
-                yt.rate_song(track["videoId"], "LIKE")
+                print(f"DEBUG: API call - Liking video ID {track['videoId']}")
+                result = yt.rate_song(track["videoId"], "LIKE")
+                print(f"DEBUG: API response: {result}")
                 print(f"Liked: {track['title']}")
             return True
         except Exception as e:
             print(
                 f"ERROR: (Retrying adding {track['title']}) {e} in {exception_sleep} seconds"
             )
+            print(f"DEBUG: Exception details: {type(e).__name__}: {str(e)}")
             time.sleep(exception_sleep)
             exception_sleep *= 2
 
@@ -529,7 +577,7 @@ def copy_playlist(
     dry_run: bool = False,
     track_sleep: float = 0.1,
     yt_search_algo: int = 0,
-    reverse_playlist: bool = True,
+    reverse_playlist: bool = False,
     privacy_status: str = "PRIVATE",
 ):
     """
@@ -545,6 +593,12 @@ def copy_playlist(
         reverse_playlist: If True, reverse the order of tracks from Spotify
         privacy_status: Privacy status of created playlist (PRIVATE, PUBLIC, UNLISTED)
     """
+    print(
+        f"DEBUG: copy_playlist started - spotify_id: {spotify_playlist_id}, yt_id: {ytmusic_playlist_id}"
+    )
+    print(
+        f"DEBUG: Parameters - dry_run: {dry_run}, reverse_playlist: {reverse_playlist}"
+    )
     print("Using search algo n°: ", yt_search_algo)
     yt = get_ytmusic()
     pl_name: str = ""
@@ -579,6 +633,9 @@ def copy_playlist(
     # Since we're adding songs in batches now, we need to use the same behavior
     # for both Spotify and YouTube Music. The reverse_playlist parameter handles the
     # Spotify side, and we'll now pass a parameter to control the YouTube Music side.
+    print(
+        f"DEBUG: Calling copier with reverse_playlist={reverse_playlist}, reverse_order={reverse_playlist}"
+    )
     copier(
         iter_spotify_playlist(
             spotify_playlist_id,
@@ -590,7 +647,7 @@ def copy_playlist(
         track_sleep,
         yt_search_algo,
         yt=yt,
-        reverse_order=not reverse_playlist,  # Invert the order for YouTube Music if needed
+        reverse_order=reverse_playlist,  # Invert the order for YouTube Music if needed
     )
 
 
@@ -599,7 +656,7 @@ def copy_all_playlists(
     dry_run: bool = False,
     spotify_playlists_encoding: str = "utf-8",
     yt_search_algo: int = 0,
-    reverse_playlist: bool = True,
+    reverse_playlist: bool = False,
     privacy_status: str = "PRIVATE",
 ):
     """
@@ -640,7 +697,7 @@ def copy_all_playlists(
             track_sleep,
             yt_search_algo,
             yt=yt,
-            reverse_order=not reverse_playlist,  # Invert the order for YouTube Music if needed
+            reverse_order=reverse_playlist,  # Invert the order for YouTube Music if needed
         )
         print("\nPlaylist done!\n")
 
